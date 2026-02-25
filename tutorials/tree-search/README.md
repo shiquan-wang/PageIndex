@@ -20,6 +20,38 @@ Reply in the following JSON format:
 }}
 """
 ```
+
+### Local Retrieval Module (LLM Tree Search)
+If you already have a PageIndex JSON tree (for example under `tests/results/*.json`), you can run an LLM-based tree search directly:
+
+```python
+from pageindex import search_tree_from_json_file
+
+query = "What does the report say about operating income in the sports segment?"
+
+# Plug your own LLM call here (OpenAI / Azure / etc.)
+def llm_caller(prompt: str) -> str:
+    # return model output string in JSON format:
+    # {"thinking": "...", "node_list": ["0016", "0017"]}
+    raise NotImplementedError
+
+result = search_tree_from_json_file(
+    query=query,
+    json_path="tests/results/q1-fy25-earnings_structure.json",
+    top_k=6,
+    llm_caller=llm_caller,
+)
+
+print(result["node_list"])      # ordered relevant node ids
+print(result["scored_nodes"])   # node metadata
+```
+
+For testing, if `llm_caller` is not provided, the function returns a deterministic default result.
+`search_tree` now supports recursive tree traversal: start from top-level nodes, then iteratively descend to deeper levels.
+Traversal stops when nodes are leaves, or subtree size is small enough (`subtree_token_budget`), or `max_traversal_depth` is reached.
+If candidate nodes at any level are too many, selection runs in chunks (`candidate_chunk_size`) to avoid oversized prompts.
+`search_tree` also supports a `preference` argument to inject user preference / expert knowledge into the prompt.
+
 <callout>
 In our dashboard and retrieval API, we use a combination of LLM tree search and value function-based Monte Carlo Tree Search ([MCTS](https://en.wikipedia.org/wiki/Monte_Carlo_tree_search)). More details will be released soon.
 </callout>

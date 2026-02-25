@@ -47,8 +47,9 @@ print(result["scored_nodes"])   # node metadata
 ```
 
 For testing, if `llm_caller` is not provided, the function returns a deterministic default result.
-`search_tree` now uses a two-stage strategy: (1) select relevant top-level nodes, then (2) rerank inside selected subtrees.
-If top-level nodes are too many, stage-1 runs in chunks (`stage1_chunk_size`) to avoid oversized prompts.
+`search_tree` now supports recursive tree traversal: start from top-level nodes, then iteratively descend to deeper levels.
+Traversal stops when nodes are leaves, or subtree size is small enough (`subtree_token_budget`), or `max_traversal_depth` is reached.
+If candidate nodes at any level are too many, selection runs in chunks (`candidate_chunk_size`) to avoid oversized prompts.
 `search_tree` also supports a `preference` argument to inject user preference / expert knowledge into the prompt.
 
 <callout>

@@ -79,28 +79,54 @@ def _clean_node_list(candidate_ids: list[Any], allowed_ids: set[str], top_k: int
     return output
 
 
-def _build_stage1_prompt(query: str, top_level_nodes: list[dict[str, Any]], preference: str | None = None, max_select: int = 8) -> str:
+def _estimate_node_tokens(node: IndexedNode) -> int:
+    text = f"{node.title}\n{node.summary}".strip()
+    # rough estimate, enough for recursion stop heuristic
+    return max(1, math.ceil(len(text) / 4))
+
+
+def _estimate_subtree_tokens(root_id: str, index: dict[str, IndexedNode]) -> int:
+    queue = [root_id]
+    token_total = 0
+    while queue:
+        current = queue.pop(0)
+        node = index[current]
+        token_total += _estimate_node_tokens(node)
+        queue.extend(node.children)
+    return token_total
+
+
+def _build_candidate_selection_prompt(
+    stage_name: str,
+    query: str,
+    candidate_ids: list[str],
+    index: dict[str, IndexedNode],
+    preference: str | None,
+    max_select: int,
+) -> str:
     candidates = []
-    for node in top_level_nodes:
+    for node_id in candidate_ids:
+        node = index[node_id]
         candidates.append(
             {
-                "node_id": str(node.get("node_id")),
-                "title": str(node.get("title", "")),
-                "summary": str(node.get("summary", "")),
-                "child_count": len(node.get("nodes", [])),
-                "start_index": node.get("start_index"),
-                "end_index": node.get("end_index"),
+                "node_id": node.node_id,
+                "title": node.title,
+                "summary": node.summary,
+                "depth": node.depth,
+                "child_count": len(node.children),
+                "start_index": node.start_index,
+                "end_index": node.end_index,
             }
         )
 
     prompt = f"""
-You are given a query and candidate top-level sections from a document tree.
-Please select the top-level nodes that are most relevant to finding the answer.
+You are doing tree search for document retrieval.
+Current stage: {stage_name}
+Select the candidate nodes most relevant to answer the query.
 
 Query: {query}
-Top-level candidate nodes: {json.dumps(candidates, ensure_ascii=False)}
+Candidate nodes: {json.dumps(candidates, ensure_ascii=False)}
 """
-
     if preference:
         prompt += f"\nExpert Knowledge of relevant sections: {preference}\n"
 
@@ -115,41 +141,41 @@ Return at most {max_select} node ids.
     return prompt.strip()
 
 
-def _build_stage2_prompt(query: str, subtree_nodes: list[dict[str, Any]], preference: str | None = None, top_k: int = 8) -> str:
-    prompt = f"""
-You are given a query and a filtered document tree structure.
-You need to find all nodes that are likely to contain the answer.
+def _llm_select_nodes(
+    stage_name: str,
+    query: str,
+    candidate_ids: list[str],
+    index: dict[str, IndexedNode],
+    llm_caller: Callable[[str], str],
+    preference: str | None,
+    max_select: int,
+    chunk_size: int,
+) -> tuple[list[str], str]:
+    if len(candidate_ids) <= chunk_size:
+        prompt = _build_candidate_selection_prompt(stage_name, query, candidate_ids, index, preference, max_select)
+        parsed = _extract_json_from_text(llm_caller(prompt))
+        selected = _clean_node_list(parsed.get("node_list", []), set(candidate_ids), top_k=max_select)
+        return selected, str(parsed.get("thinking", ""))
 
-Query: {query}
-Document tree structure: {json.dumps(subtree_nodes, ensure_ascii=False)}
-"""
+    chunk_count = math.ceil(len(candidate_ids) / chunk_size)
+    per_chunk_select = max(1, math.ceil(max_select / chunk_count))
 
-    if preference:
-        prompt += f"\nExpert Knowledge of relevant sections: {preference}\n"
+    merged: list[str] = []
+    thinking_parts: list[str] = []
+    for i in range(0, len(candidate_ids), chunk_size):
+        chunk = candidate_ids[i:i + chunk_size]
+        prompt = _build_candidate_selection_prompt(stage_name, query, chunk, index, preference, per_chunk_select)
+        parsed = _extract_json_from_text(llm_caller(prompt))
+        thinking = str(parsed.get("thinking", ""))
+        if thinking:
+            thinking_parts.append(f"chunk[{i // chunk_size + 1}]: {thinking}")
 
-    prompt += f"""
-Reply in JSON format:
-{{
-  "thinking": <your reasoning about which nodes are relevant>,
-  "node_list": [node_id1, node_id2, ...]
-}}
-Return at most {top_k} node ids.
-"""
-    return prompt.strip()
+        chunk_selected = _clean_node_list(parsed.get("node_list", []), set(chunk), top_k=per_chunk_select)
+        for node_id in chunk_selected:
+            if node_id not in merged:
+                merged.append(node_id)
 
-
-def _collect_subtree_ids(root_id: str, index: dict[str, IndexedNode]) -> list[str]:
-    queue = [root_id]
-    result: list[str] = []
-    while queue:
-        current = queue.pop(0)
-        result.append(current)
-        queue.extend(index[current].children)
-    return result
-
-
-def _extract_subtrees(root_nodes: list[dict[str, Any]], selected_root_ids: set[str]) -> list[dict[str, Any]]:
-    return [node for node in root_nodes if str(node.get("node_id")) in selected_root_ids]
+    return merged[:max_select], " | ".join(thinking_parts)
 
 
 def _default_tree_search_result(index: dict[str, IndexedNode], top_k: int) -> dict[str, Any]:
@@ -161,42 +187,6 @@ def _default_tree_search_result(index: dict[str, IndexedNode], top_k: int) -> di
     }
 
 
-def _llm_select_top_level_nodes(
-    query: str,
-    root_nodes: list[dict[str, Any]],
-    all_node_ids: set[str],
-    llm_caller: Callable[[str], str],
-    preference: str | None,
-    stage1_max_roots: int,
-    stage1_chunk_size: int,
-) -> tuple[list[str], str]:
-    if len(root_nodes) <= stage1_chunk_size:
-        prompt = _build_stage1_prompt(query=query, top_level_nodes=root_nodes, preference=preference, max_select=stage1_max_roots)
-        parsed = _extract_json_from_text(llm_caller(prompt))
-        selected = _clean_node_list(parsed.get("node_list", []), all_node_ids, top_k=stage1_max_roots)
-        thinking = str(parsed.get("thinking", ""))
-        return selected, thinking
-
-    chunk_count = math.ceil(len(root_nodes) / stage1_chunk_size)
-    per_chunk_select = max(1, math.ceil(stage1_max_roots / chunk_count))
-
-    merged: list[str] = []
-    thinking_parts: list[str] = []
-    for i in range(0, len(root_nodes), stage1_chunk_size):
-        chunk = root_nodes[i:i + stage1_chunk_size]
-        prompt = _build_stage1_prompt(query=query, top_level_nodes=chunk, preference=preference, max_select=per_chunk_select)
-        parsed = _extract_json_from_text(llm_caller(prompt))
-        thinking = str(parsed.get("thinking", ""))
-        if thinking:
-            thinking_parts.append(f"chunk[{i // stage1_chunk_size + 1}]: {thinking}")
-        chunk_selected = _clean_node_list(parsed.get("node_list", []), all_node_ids, top_k=per_chunk_select)
-        for node_id in chunk_selected:
-            if node_id not in merged:
-                merged.append(node_id)
-
-    return merged[:stage1_max_roots], " | ".join(thinking_parts)
-
-
 def search_tree(
     query: str,
     tree_json: dict[str, Any] | list[dict[str, Any]],
@@ -204,14 +194,17 @@ def search_tree(
     preference: str | None = None,
     llm_caller: Callable[[str], str] | None = None,
     stage1_max_roots: int = 6,
-    stage1_chunk_size: int = 20,
+    candidate_chunk_size: int = 20,
+    max_traversal_depth: int = 4,
+    subtree_token_budget: int = 1600,
+    per_level_max_select: int = 8,
 ) -> dict[str, Any]:
-    """Two-stage LLM-based tree retrieval.
+    """Recursive LLM tree retrieval with stop conditions.
 
-    Stage 1: select relevant top-level roots (supports chunked selection when root count is large).
-    Stage 2: rerank/choose final nodes only inside the selected subtrees.
-
-    If llm_caller is None, a deterministic fallback result is returned for testing.
+    Traversal recursively descends relevant nodes until stop conditions are met:
+      - node is leaf
+      - estimated subtree token size <= subtree_token_budget
+      - traversal level reaches max_traversal_depth
     """
     root_nodes = _normalize_tree_input(tree_json)
     index = build_tree_index(tree_json)
@@ -220,43 +213,90 @@ def search_tree(
 
     if llm_caller is None:
         result = _default_tree_search_result(index=index, top_k=top_k)
-        stage1_node_list = []
+        final_node_ids = result["node_list"]
+        stage1_node_list: list[str] = []
         final_thinking = result["thinking"]
     else:
-        all_node_ids = set(index.keys())
-        stage1_selected, stage1_thinking = _llm_select_top_level_nodes(
+        root_ids = [str(node.get("node_id")) for node in root_nodes]
+        stage1_node_list, stage1_thinking = _llm_select_nodes(
+            stage_name="stage-1 top-level prefilter",
             query=query,
-            root_nodes=root_nodes,
-            all_node_ids=all_node_ids,
+            candidate_ids=root_ids,
+            index=index,
             llm_caller=llm_caller,
             preference=preference,
-            stage1_max_roots=stage1_max_roots,
-            stage1_chunk_size=stage1_chunk_size,
+            max_select=stage1_max_roots,
+            chunk_size=candidate_chunk_size,
         )
-
-        if not stage1_selected:
-            stage1_selected = [str(node.get("node_id")) for node in root_nodes[:stage1_max_roots]]
+        if not stage1_node_list:
+            stage1_node_list = root_ids[:stage1_max_roots]
             stage1_thinking = f"{stage1_thinking} | stage1 fallback to first top-level nodes.".strip(" |")
 
-        selected_subtrees = _extract_subtrees(root_nodes, set(stage1_selected))
-        prompt_stage2 = _build_stage2_prompt(query=query, subtree_nodes=selected_subtrees, preference=preference, top_k=top_k)
-        parsed_stage2 = _extract_json_from_text(llm_caller(prompt_stage2))
+        traversal_thinking_parts = [f"stage1: {stage1_thinking}"]
 
-        candidate_ids = _clean_node_list(parsed_stage2.get("node_list", []), all_node_ids, top_k=top_k)
-        if not candidate_ids:
-            # deterministic local fallback inside selected roots
-            candidate_ids = []
-            for root_id in stage1_selected:
-                candidate_ids.extend(_collect_subtree_ids(root_id, index))
-            candidate_ids = _clean_node_list(candidate_ids, all_node_ids, top_k=top_k)
+        frontier = stage1_node_list
+        terminal_candidates: list[str] = []
 
-        stage2_thinking = str(parsed_stage2.get("thinking", ""))
-        final_thinking = f"stage1: {stage1_thinking}\nstage2: {stage2_thinking}".strip()
-        result = {"node_list": candidate_ids}
-        stage1_node_list = stage1_selected
+        for depth in range(1, max_traversal_depth + 1):
+            if not frontier:
+                break
+
+            selected, level_thinking = _llm_select_nodes(
+                stage_name=f"recursive-level-{depth}",
+                query=query,
+                candidate_ids=frontier,
+                index=index,
+                llm_caller=llm_caller,
+                preference=preference,
+                max_select=per_level_max_select,
+                chunk_size=candidate_chunk_size,
+            )
+            if not selected:
+                selected = frontier[:per_level_max_select]
+                level_thinking = f"{level_thinking} | level fallback to deterministic order.".strip(" |")
+
+            traversal_thinking_parts.append(f"level{depth}: {level_thinking}")
+
+            next_frontier: list[str] = []
+            for node_id in selected:
+                node = index[node_id]
+                if not node.children:
+                    terminal_candidates.append(node_id)
+                    continue
+
+                subtree_tokens = _estimate_subtree_tokens(node_id, index)
+                if subtree_tokens <= subtree_token_budget or depth >= max_traversal_depth:
+                    terminal_candidates.append(node_id)
+                else:
+                    next_frontier.extend(node.children)
+
+            if not next_frontier:
+                break
+            frontier = next_frontier
+
+        if not terminal_candidates:
+            terminal_candidates = stage1_node_list.copy()
+
+        terminal_candidates = _clean_node_list(terminal_candidates, set(index.keys()))
+
+        final_node_ids, final_thinking = _llm_select_nodes(
+            stage_name="final-rerank",
+            query=query,
+            candidate_ids=terminal_candidates,
+            index=index,
+            llm_caller=llm_caller,
+            preference=preference,
+            max_select=top_k,
+            chunk_size=candidate_chunk_size,
+        )
+        if not final_node_ids:
+            final_node_ids = terminal_candidates[:top_k]
+            final_thinking = f"{final_thinking} | final fallback to terminal candidate order.".strip(" |")
+
+        final_thinking = "\n".join(traversal_thinking_parts + [f"final: {final_thinking}"])
 
     scored_nodes = []
-    for node_id in result["node_list"]:
+    for node_id in final_node_ids:
         node = index.get(node_id)
         if node is None:
             continue
@@ -285,7 +325,10 @@ def search_tree_from_json_file(
     preference: str | None = None,
     llm_caller: Callable[[str], str] | None = None,
     stage1_max_roots: int = 6,
-    stage1_chunk_size: int = 20,
+    candidate_chunk_size: int = 20,
+    max_traversal_depth: int = 4,
+    subtree_token_budget: int = 1600,
+    per_level_max_select: int = 8,
 ) -> dict[str, Any]:
     with open(json_path, "r", encoding="utf-8") as f:
         tree_json = json.load(f)
@@ -296,5 +339,8 @@ def search_tree_from_json_file(
         preference=preference,
         llm_caller=llm_caller,
         stage1_max_roots=stage1_max_roots,
-        stage1_chunk_size=stage1_chunk_size,
+        candidate_chunk_size=candidate_chunk_size,
+        max_traversal_depth=max_traversal_depth,
+        subtree_token_budget=subtree_token_budget,
+        per_level_max_select=per_level_max_select,
     )

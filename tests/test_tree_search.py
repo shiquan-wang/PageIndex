@@ -18,45 +18,29 @@ def test_search_tree_from_json_file_default_fallback_returns_nodes():
     assert "fallback" in result["thinking"].lower()
 
 
-def test_search_tree_two_stage_uses_llm_response_node_list():
-    with FIXTURE.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    call_count = {"n": 0}
-
-    def fake_llm(prompt: str) -> str:
-        call_count["n"] += 1
-        if "Top-level candidate nodes" in prompt:
-            return json.dumps(
-                {
-                    "thinking": "Sports-related root is relevant.",
-                    "node_list": ["0016"],
-                }
-            )
-        return json.dumps(
-            {
-                "thinking": "Sports segment details are likely relevant.",
-                "node_list": ["0017", "0016"],
-            }
-        )
-
-    result = search_tree(
-        query="operating income",
-        tree_json=data,
-        top_k=8,
-        preference="prioritize sports segment",
-        llm_caller=fake_llm,
-    )
-    assert call_count["n"] == 2
-    assert result["stage1_node_list"] == ["0016"]
-    assert result["node_list"] == ["0017", "0016"]
-
-
-def test_stage1_chunking_when_top_level_is_large():
-    large_tree = {
+def test_recursive_tree_search_uses_multi_level_selection():
+    tree = {
         "structure": [
-            {"node_id": f"r{i:03d}", "title": f"Root {i}", "summary": "", "start_index": i, "end_index": i, "nodes": []}
-            for i in range(25)
+            {
+                "node_id": "r1",
+                "title": "Root 1",
+                "summary": "",
+                "start_index": 1,
+                "end_index": 1,
+                "nodes": [
+                    {
+                        "node_id": "c1",
+                        "title": "Child 1",
+                        "summary": "",
+                        "start_index": 2,
+                        "end_index": 2,
+                        "nodes": [
+                            {"node_id": "l1", "title": "Leaf 1", "summary": "", "start_index": 3, "end_index": 3, "nodes": []},
+                            {"node_id": "l2", "title": "Leaf 2", "summary": "", "start_index": 4, "end_index": 4, "nodes": []},
+                        ],
+                    }
+                ],
+            }
         ]
     }
 
@@ -64,25 +48,74 @@ def test_stage1_chunking_when_top_level_is_large():
 
     def fake_llm(prompt: str) -> str:
         prompts.append(prompt)
-        if "Top-level candidate nodes" in prompt:
-            # select one id from each chunk via prompt content
-            if "r000" in prompt:
-                return json.dumps({"thinking": "chunk1", "node_list": ["r001"]})
-            if "r010" in prompt:
-                return json.dumps({"thinking": "chunk2", "node_list": ["r012"]})
-            return json.dumps({"thinking": "chunk3", "node_list": ["r022"]})
-        return json.dumps({"thinking": "stage2", "node_list": ["r012", "r022"]})
+        if "stage-1 top-level prefilter" in prompt:
+            return json.dumps({"thinking": "pick root", "node_list": ["r1"]})
+        if "recursive-level-1" in prompt:
+            return json.dumps({"thinking": "descend", "node_list": ["r1"]})
+        if "recursive-level-2" in prompt:
+            return json.dumps({"thinking": "pick child", "node_list": ["c1"]})
+        if "recursive-level-3" in prompt:
+            return json.dumps({"thinking": "pick leaves", "node_list": ["l1", "l2"]})
+        return json.dumps({"thinking": "final", "node_list": ["l2", "l1"]})
 
     result = search_tree(
-        query="anything",
-        tree_json=large_tree,
-        top_k=3,
+        query="find details",
+        tree_json=tree,
+        top_k=2,
         llm_caller=fake_llm,
-        stage1_max_roots=3,
-        stage1_chunk_size=10,
+        max_traversal_depth=4,
+        subtree_token_budget=1,
+        per_level_max_select=2,
     )
 
-    stage1_prompt_count = sum("Top-level candidate nodes" in p for p in prompts)
-    assert stage1_prompt_count == 3
-    assert result["stage1_node_list"] == ["r001", "r012", "r022"]
-    assert result["node_list"] == ["r012", "r022"]
+    assert result["stage1_node_list"] == ["r1"]
+    assert result["node_list"] == ["l2", "l1"]
+    assert any("recursive-level-3" in p for p in prompts)
+
+
+def test_recursive_candidate_chunking_when_frontier_is_large():
+    tree = {
+        "structure": [
+            {
+                "node_id": "r1",
+                "title": "Root",
+                "summary": "",
+                "start_index": 1,
+                "end_index": 1,
+                "nodes": [
+                    {"node_id": f"c{i:03d}", "title": f"Child {i}", "summary": "", "start_index": i, "end_index": i, "nodes": []}
+                    for i in range(25)
+                ],
+            }
+        ]
+    }
+
+    prompts = []
+
+    def fake_llm(prompt: str) -> str:
+        prompts.append(prompt)
+        if "stage-1 top-level prefilter" in prompt:
+            return json.dumps({"thinking": "r", "node_list": ["r1"]})
+        if "recursive-level-1" in prompt:
+            return json.dumps({"thinking": "go root", "node_list": ["r1"]})
+        if "recursive-level-2" in prompt:
+            if "c000" in prompt:
+                return json.dumps({"thinking": "chunk1", "node_list": ["c001"]})
+            if "c010" in prompt:
+                return json.dumps({"thinking": "chunk2", "node_list": ["c012"]})
+            return json.dumps({"thinking": "chunk3", "node_list": ["c022"]})
+        return json.dumps({"thinking": "final", "node_list": ["c012", "c022"]})
+
+    result = search_tree(
+        query="find relevant leaf",
+        tree_json=tree,
+        llm_caller=fake_llm,
+        top_k=2,
+        candidate_chunk_size=10,
+        per_level_max_select=3,
+        subtree_token_budget=1,
+    )
+
+    recursive_level_2_prompt_count = sum("recursive-level-2" in p for p in prompts)
+    assert recursive_level_2_prompt_count == 3
+    assert result["node_list"] == ["c012", "c022"]

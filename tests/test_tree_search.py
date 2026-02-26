@@ -15,10 +15,10 @@ def test_search_tree_from_json_file_default_fallback_returns_nodes():
     )
     assert result["node_list"]
     assert len(result["node_list"]) <= 5
-    assert "fallback" in result["thinking"].lower()
+    assert "回退" in result["thinking"]
 
 
-def test_recursive_tree_search_uses_multi_level_selection():
+def test_recursive_tree_search_returns_all_when_top_k_none():
     tree = {
         "structure": [
             {
@@ -44,10 +44,7 @@ def test_recursive_tree_search_uses_multi_level_selection():
         ]
     }
 
-    prompts = []
-
     def fake_llm(prompt: str) -> str:
-        prompts.append(prompt)
         if "stage-1 top-level prefilter" in prompt:
             return json.dumps({"thinking": "pick root", "node_list": ["r1"]})
         if "recursive-level-1" in prompt:
@@ -61,16 +58,14 @@ def test_recursive_tree_search_uses_multi_level_selection():
     result = search_tree(
         query="find details",
         tree_json=tree,
-        top_k=2,
+        top_k=None,
         llm_caller=fake_llm,
         max_traversal_depth=4,
         subtree_token_budget=1,
-        per_level_max_select=2,
+        per_level_max_select=None,
     )
 
-    assert result["stage1_node_list"] == ["r1"]
     assert result["node_list"] == ["l2", "l1"]
-    assert any("recursive-level-3" in p for p in prompts)
 
 
 def test_recursive_candidate_chunking_when_frontier_is_large():

@@ -38,7 +38,7 @@ def llm_caller(prompt: str) -> str:
 result = search_tree_from_json_file(
     query=query,
     json_path="tests/results/q1-fy25-earnings_structure.json",
-    top_k=6,
+    top_k=None,  # None means return all relevant nodes
     llm_caller=llm_caller,
 )
 
@@ -50,6 +50,7 @@ For testing, if `llm_caller` is not provided, the function returns a determinist
 `search_tree` now supports recursive tree traversal: start from top-level nodes, then iteratively descend to deeper levels.
 Traversal stops when nodes are leaves, or subtree size is small enough (`subtree_token_budget`), or `max_traversal_depth` is reached.
 If candidate nodes at any level are too many, selection runs in chunks (`candidate_chunk_size`) to avoid oversized prompts.
+To return all relevant nodes, set `top_k=None`; to control traversal breadth, tune `stage1_max_roots` (top-level breadth) and `per_level_max_select` (per-depth breadth).
 `search_tree` also supports a `preference` argument to inject user preference / expert knowledge into the prompt.
 
 <callout>
